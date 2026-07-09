@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pymq"
+version = "0.1.0"
+description = "Redis-backed work queue for Python with Lua-atomic state transitions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "redis>=5.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.5",
+    "pyright>=1.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
