@@ -1,10 +1,12 @@
 """Tests for pymq.options module."""
 
-import pytest
 from datetime import timedelta
 
+import pytest
+
 from pymq.errors import InvalidConfigError
-from pymq.options import Options, default_backoff
+from pymq.options import AckRetentionPolicy, Options, default_backoff
+from pymq.queue import Queue
 
 
 class TestDefaultBackoff:
@@ -30,6 +32,8 @@ class TestOptions:
         assert opts.poll_interval == timedelta(milliseconds=50)
         assert opts.heartbeat_interval == timedelta(seconds=10)
         assert opts.dedupe_ttl == timedelta(hours=24)
+        assert opts.done_retention_ttl == timedelta(0)
+        assert opts.ack_retention_policy == AckRetentionPolicy.RETAIN_ACKED
         assert opts.max_attempts == 3
         assert opts.consumer_id == "pymq-consumer"
 
@@ -60,3 +64,19 @@ class TestOptions:
                 poll_timeout=timedelta(seconds=1),
                 poll_interval=timedelta(seconds=2),
             )
+
+    def test_invalid_ack_retention_policy_fails(self):
+        with pytest.raises(InvalidConfigError):
+            Options(queue_name="q1", ack_retention_policy="invalid")  # type: ignore[arg-type]
+
+    def test_negative_done_retention_ttl_fails(self):
+        with pytest.raises(InvalidConfigError):
+            Options(queue_name="q1", done_retention_ttl=timedelta(seconds=-1))
+
+    async def test_queue_accepts_done_retention_ttl(self, redis_client):
+        queue = Queue(
+            redis_client,
+            queue_name="retention-options",
+            done_retention_ttl=timedelta(hours=1),
+        )
+        assert queue._options.done_retention_ttl == timedelta(hours=1)

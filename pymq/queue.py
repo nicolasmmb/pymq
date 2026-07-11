@@ -12,14 +12,20 @@ import json
 import logging
 import socket
 import uuid
-from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, get_type_hints
+from typing import Any, get_type_hints
 
 from pydantic import TypeAdapter
 from redis.asyncio import Redis
 
+from pymq.admin import (
+    MessageInfo,
+    Stats,
+    parse_message_info,
+    parse_message_info_list,
+    parse_stats,
+)
 from pymq.errors import (
     AlreadyDoneError,
     DLQError,
@@ -30,11 +36,15 @@ from pymq.errors import (
     LostOwnershipError,
     NoMessageError,
 )
-from pymq.event import Event, EventStatus, Hooks, Operation, Observer
-from pymq.keys import RedisKeys, make_redis_keys
+from pymq.event import Event, EventStatus, Hooks, Operation
+from pymq.keys import make_redis_keys
 from pymq.message import Delivery, Message
 from pymq.middleware import Handler, chain_consumer, chain_producer
-from pymq.options import EnqueueOptions, NackOptions, Options
+from pymq.options import (
+    AckRetentionPolicy,
+    ListOptions,
+    Options,
+)
 
 logger = logging.getLogger("pymq")
 
@@ -51,6 +61,9 @@ SCRIPT_NAMES = [
     "list_dlq",
     "requeue_dlq",
     "delete_dlq",
+    "list_done",
+    "delete_done",
+    "prune_done",
     "worker_heartbeat",
     "worker_list",
     "worker_control_set",
@@ -168,7 +181,7 @@ class Queue:
     def __init__(self, client: Redis, **kwargs: Any) -> None:
         if client is None:
             raise InvalidConfigError(op="new", message="redis client is required")
-        opts_kwargs = {k: v for k, v in kwargs.items() if hasattr(Options, k)}
+        opts_kwargs = {k: v for k, v in kwargs.items() if k in Options.__dataclass_fields__}
         if "queue_name" not in opts_kwargs:
             opts_kwargs["queue_name"] = kwargs.get("queue_name", "")
         self._client = client
@@ -304,7 +317,9 @@ class Queue:
 
         Corresponds to gomq/queue.go Enqueue() + enqueue().
         """
-        return await chain_producer(self._enqueue, self._options.producer_middlewares)(msg, id=id, delay=delay)
+        return await chain_producer(self._enqueue, self._options.producer_middlewares)(
+            msg, id=id, delay=delay
+        )
 
     async def _enqueue(
         self,
@@ -320,7 +335,12 @@ class Queue:
         if msg_delay < timedelta(0):
             err = InvalidConfigError(op="enqueue", message="delay cannot be negative")
             self._emit(
-                Event(operation=Operation.ENQUEUE, status=EventStatus.ERROR, message_id=msg_id, error=err)
+                Event(
+                    operation=Operation.ENQUEUE,
+                    status=EventStatus.ERROR,
+                    message_id=msg_id,
+                    error=err,
+                )
             )
             raise err
 
@@ -337,6 +357,7 @@ class Queue:
             [
                 self._keys.ready,
                 self._keys.done,
+                self._keys.dedupe,
                 self._keys.payloads,
                 self._keys.headers,
                 self._keys.states,
@@ -344,6 +365,7 @@ class Queue:
                 self._keys.tokens,
                 self._keys.leases,
                 self._keys.metadata,
+                self._keys.errors,
             ],
             msg_id,
             payload_bytes,
@@ -439,7 +461,9 @@ class Queue:
             if self._options.poll_timeout <= timedelta(0) or (deadline > 0 and now >= deadline):
                 raise NoMessageError()
 
-            remaining = deadline - now if deadline > 0 else self._options.poll_interval.total_seconds()
+            remaining = (
+                deadline - now if deadline > 0 else self._options.poll_interval.total_seconds()
+            )
             sleep_for = min(self._options.poll_interval.total_seconds(), max(remaining, 0))
             await asyncio.sleep(sleep_for)
 
@@ -501,7 +525,9 @@ class Queue:
 
         d = Delivery[bytes](
             id=_to_str(result[1]),
-            payload=(_to_str(result[2])).encode() if isinstance(result[2], str) else (result[2] or b""),
+            payload=(_to_str(result[2])).encode()
+            if isinstance(result[2], str)
+            else (result[2] or b""),
             headers=headers,
             token=_to_str(result[6]),
             attempts=_to_int(result[4]),
@@ -532,6 +558,7 @@ class Queue:
             [
                 self._keys.inflight,
                 self._keys.done,
+                self._keys.dedupe,
                 self._keys.payloads,
                 self._keys.headers,
                 self._keys.states,
@@ -539,10 +566,12 @@ class Queue:
                 self._keys.tokens,
                 self._keys.leases,
                 self._keys.metadata,
+                self._keys.errors,
             ],
             id,
             token,
             _duration_ms(self._options.dedupe_ttl),
+            AckRetentionPolicy(self._options.ack_retention_policy).value,
         )
 
         status = _first_script_status(result)
@@ -753,7 +782,12 @@ class Queue:
 
         if status == "ok":
             self._emit(
-                Event(operation=Operation.EXTEND, status=EventStatus.OK, message_id=id, duration=duration)
+                Event(
+                    operation=Operation.EXTEND,
+                    status=EventStatus.OK,
+                    message_id=id,
+                    duration=duration,
+                )
             )
             return
 
@@ -855,9 +889,7 @@ class Queue:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _worker_loop(
-        self, worker_id: int, handler: Handler, stop: asyncio.Event
-    ) -> None:
+    async def _worker_loop(self, worker_id: int, handler: Handler, stop: asyncio.Event) -> None:
         """Single worker loop: receive → handler → ack/nack."""
         while not stop.is_set():
             try:
@@ -969,6 +1001,106 @@ class Queue:
             )
 
         return moved
+
+    async def stats(self) -> Stats:
+        """Return queue counts and oldest ready/DLQ ages."""
+        result = await self._eval(
+            "stats",
+            [self._keys.ready, self._keys.inflight, self._keys.dlq, self._keys.done],
+        )
+        return parse_stats(result)
+
+    async def inspect(self, id: str) -> MessageInfo:
+        """Return a job snapshot, including retained completed jobs."""
+        if not id:
+            raise InvalidConfigError(op="inspect", message="id is required")
+        result = await self._eval(
+            "inspect_message",
+            [
+                self._keys.payloads,
+                self._keys.headers,
+                self._keys.states,
+                self._keys.attempts,
+                self._keys.leases,
+                self._keys.errors,
+                self._keys.dlq,
+                self._keys.done,
+            ],
+            id,
+        )
+        return parse_message_info(result)
+
+    async def list_done(self, options: ListOptions | None = None) -> list[MessageInfo]:
+        """List retained completed jobs."""
+        offset, count = self._list_options(options)
+        result = await self._eval(
+            "list_done",
+            [
+                self._keys.done,
+                self._keys.payloads,
+                self._keys.headers,
+                self._keys.states,
+                self._keys.attempts,
+                self._keys.leases,
+                self._keys.errors,
+            ],
+            offset,
+            count,
+        )
+        return parse_message_info_list(result)
+
+    async def delete_done(self, id: str) -> None:
+        """Delete a completed record and immediately release its ID."""
+        result = await self._eval(
+            "delete_done",
+            [
+                self._keys.done,
+                self._keys.dedupe,
+                self._keys.payloads,
+                self._keys.headers,
+                self._keys.states,
+                self._keys.attempts,
+                self._keys.tokens,
+                self._keys.leases,
+                self._keys.errors,
+                self._keys.metadata,
+            ],
+            id,
+        )
+        if _first_script_status(result) != "ok":
+            raise NoMessageError()
+        self._emit(Event(operation=Operation.ADMIN, status=EventStatus.DELETE_DONE, message_id=id))
+
+    async def prune_done(self, older_than: timedelta, limit: int = 100) -> int:
+        """Delete completed records older than ``older_than``."""
+        if older_than < timedelta(0):
+            raise InvalidConfigError(op="prune_done", message="older_than cannot be negative")
+        limit = min(max(limit, 1), 1000)
+        result = await self._eval(
+            "prune_done",
+            [
+                self._keys.done,
+                self._keys.payloads,
+                self._keys.headers,
+                self._keys.states,
+                self._keys.attempts,
+                self._keys.tokens,
+                self._keys.leases,
+                self._keys.errors,
+                self._keys.metadata,
+            ],
+            _duration_ms(older_than),
+            limit,
+        )
+        self._emit(Event(operation=Operation.ADMIN, status=EventStatus.PRUNE_DONE))
+        return _to_int(result)
+
+    @staticmethod
+    def _list_options(options: ListOptions | None) -> tuple[int, int]:
+        options = options or ListOptions()
+        if options.offset < 0:
+            raise InvalidConfigError(op="list", message="offset cannot be negative")
+        return options.offset, min(max(options.count, 1), 1000)
 
     def _extract_payload_type(self, handler: Handler) -> type:
         """Extract T from Delivery[T] in handler's type annotation.

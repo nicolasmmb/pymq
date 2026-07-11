@@ -69,8 +69,35 @@ queue = Queue(
     visibility_timeout=timedelta(seconds=30),
     max_attempts=5,
     poll_timeout=timedelta(seconds=10),
+    done_retention_ttl=timedelta(days=7),
 )
 ```
+
+## Retention and dedupe
+
+Completed jobs retain payload, headers, attempts, and the last error by default.
+Use `AckRetentionPolicy.DELETE_ACKED` to keep only the completed marker.
+
+```python
+from datetime import timedelta
+from pymq import AckRetentionPolicy, ListOptions
+
+queue = Queue(
+    redis,
+    queue_name="orders",
+    done_retention_ttl=timedelta(days=7),
+    ack_retention_policy=AckRetentionPolicy.RETAIN_ACKED,
+)
+
+info = await queue.inspect("order-123")
+completed = await queue.list_done(ListOptions(count=100))
+await queue.delete_done("order-123")
+await queue.prune_done(timedelta(days=7), limit=1000)
+```
+
+`run_reaper()` removes records older than `done_retention_ttl`; a zero TTL
+retains them indefinitely. `dedupe_ttl` remains independent, so a reused ID
+after its dedupe period replaces its earlier retained record.
 
 ## Ack / Nack / Extend
 

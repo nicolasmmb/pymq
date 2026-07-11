@@ -30,9 +30,12 @@ async def run_reaper(queue: Any, interval: timedelta, limit: int = 100) -> None:
         try:
             await queue.reap_expired(limit)
         except Exception as err:
-            queue._emit(
-                Event(operation=Operation.REAP, status=EventStatus.ERROR, error=err)
-            )
+            queue._emit(Event(operation=Operation.REAP, status=EventStatus.ERROR, error=err))
+        if queue._options.done_retention_ttl > timedelta(0):
+            try:
+                await queue.prune_done(queue._options.done_retention_ttl, limit)
+            except Exception as err:
+                queue._emit(Event(operation=Operation.ADMIN, status=EventStatus.ERROR, error=err))
 
 
 async def consume_with_signals(

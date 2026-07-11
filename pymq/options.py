@@ -5,9 +5,11 @@ Corresponds to gomq/options.go — Options struct with defaults and validation.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, Callable
+from enum import StrEnum
+from typing import Any
 
 from pymq.errors import InvalidConfigError
 
@@ -21,6 +23,13 @@ def default_backoff(attempt: int) -> timedelta:
     d = timedelta(seconds=a)
     cap = timedelta(seconds=30)
     return min(d, cap)
+
+
+class AckRetentionPolicy(StrEnum):
+    """Controls whether completed job data remains available after ACK."""
+
+    RETAIN_ACKED = "retain_acked"
+    DELETE_ACKED = "delete_acked"
 
 
 @dataclass
@@ -37,8 +46,10 @@ class Options:
     poll_interval: timedelta = field(default=timedelta(milliseconds=50))
     heartbeat_interval: timedelta | None = None
     dedupe_ttl: timedelta = field(default=timedelta(hours=24))
+    done_retention_ttl: timedelta = field(default_factory=timedelta)
     max_attempts: int = 3
     consumer_id: str = "pymq-consumer"
+    ack_retention_policy: AckRetentionPolicy = AckRetentionPolicy.RETAIN_ACKED
     retry_backoff: Callable[[int], timedelta] | None = None
 
     # Observability
@@ -72,6 +83,13 @@ class Options:
             errors.append("max_attempts must be positive")
         if self.dedupe_ttl < timedelta(0):
             errors.append("dedupe_ttl cannot be negative")
+        if self.done_retention_ttl < timedelta(0):
+            errors.append("done_retention_ttl cannot be negative")
+        if self.ack_retention_policy not in (
+            AckRetentionPolicy.RETAIN_ACKED,
+            AckRetentionPolicy.DELETE_ACKED,
+        ):
+            errors.append("ack_retention_policy must be RETAIN_ACKED or DELETE_ACKED")
         if (
             self.heartbeat_interval is not None
             and self.visibility_timeout > timedelta(0)

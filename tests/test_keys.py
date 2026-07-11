@@ -10,6 +10,7 @@ class TestMakeRedisKeys:
         assert keys.inflight == "gomq:{myqueue}:inflight"
         assert keys.dlq == "gomq:{myqueue}:dlq"
         assert keys.done == "gomq:{myqueue}:done"
+        assert keys.dedupe == "gomq:{myqueue}:dedupe"
         assert keys.payloads == "gomq:{myqueue}:payloads"
         assert keys.headers == "gomq:{myqueue}:headers"
         assert keys.states == "gomq:{myqueue}:states"

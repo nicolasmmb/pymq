@@ -10,9 +10,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from pymq.errors import InvalidConfigError, NoMessageError
-from pymq.event import Event, EventStatus, Operation
-from pymq.options import ListOptions, RequeueOptions
+from pymq.errors import NoMessageError
 from pymq.state import MessageState
 
 
@@ -46,6 +44,7 @@ class MessageInfo:
     lease_until_ms: int = 0
     last_error: str = ""
     dlq_score: float = 0.0
+    done_score: float = 0.0
 
 
 # Admin methods are mixed into Queue via the queue module.
@@ -76,11 +75,13 @@ def parse_message_info(result: Any) -> MessageInfo:
 
     Mirrors gomq/admin.go parseMessageInfo().
     """
-    if not isinstance(result, (list, tuple)) or len(result) < 10:
+    if not isinstance(result, (list, tuple)):
         raise ValueError(f"unexpected message info result {result!r}")
     status = _to_str(result[0])
     if status != "ok":
         raise NoMessageError()
+    if len(result) < 10:
+        raise ValueError(f"unexpected message info result {result!r}")
     return _parse_message_info_fields(result[1:10])
 
 
@@ -115,6 +116,8 @@ def _parse_message_info_fields(values: tuple | list) -> MessageInfo:
         last_error=_to_str(values[6]),
         dlq_score=_to_float(values[7]),
     )
+    if len(values) >= 9:
+        info.done_score = _to_float(values[8])
     raw_headers = _to_str(values[2])
     if raw_headers:
         try:
@@ -140,7 +143,10 @@ def _to_float(v: Any) -> float:
     if isinstance(v, float):
         return v
     if isinstance(v, (int, bytes, str)):
-        return float(v)
+        try:
+            return float(v)
+        except ValueError:
+            return 0.0
     return 0.0
 
 

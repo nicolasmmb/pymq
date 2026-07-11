@@ -2,12 +2,13 @@
 
 import asyncio
 from datetime import timedelta
-from pydantic import BaseModel
 
 import pytest
+from pydantic import BaseModel
 
 from pymq.errors import DuplicateError, NoMessageError
 from pymq.message import Delivery, Message
+from pymq.options import AckRetentionPolicy, ListOptions
 from pymq.queue import Queue
 
 
@@ -96,6 +97,91 @@ class TestDuplicateDetection:
             await queue.enqueue(Message(payload=b"b"), id="dup-1")
 
 
+class TestDoneRetention:
+    async def test_ack_retains_completed_job(self, queue: Queue):
+        await queue.enqueue(
+            Message(payload=b"keep", headers={"kind": "retained"}),
+            id="keep",
+        )
+        delivery = await queue._claim_once()
+        await queue._client.hset(queue._keys.errors, delivery.id, "previous retry")
+        await delivery.ack()
+
+        info = await queue.inspect("keep")
+        assert info.state.value == "done"
+        assert info.payload == b"keep"
+        assert info.headers == {"kind": "retained"}
+        assert info.attempts == 1
+        assert info.last_error == "previous retry"
+        assert info.done_score > 0
+
+        items = await queue.list_done(ListOptions(count=10))
+        assert len(items) == 1
+        assert items[0].id == "keep"
+        assert items[0].payload == b"keep"
+
+    async def test_delete_acked_keeps_only_marker(self, queue: Queue):
+        queue._options.ack_retention_policy = AckRetentionPolicy.DELETE_ACKED
+        await queue.enqueue(Message(payload=b"drop"), id="drop")
+        delivery = await queue._claim_once()
+        await delivery.ack()
+
+        info = await queue.inspect("drop")
+        assert info.state.value == "done"
+        assert info.payload == b""
+        assert info.done_score > 0
+
+    async def test_delete_and_prune_done(self, queue: Queue):
+        await queue.enqueue(Message(payload=b"delete"), id="delete")
+        delivery = await queue._claim_once()
+        await delivery.ack()
+        await queue.delete_done("delete")
+        with pytest.raises(NoMessageError):
+            await queue.inspect("delete")
+        assert await queue.enqueue(Message(payload=b"reused"), id="delete") == "delete"
+
+        delivery = await queue._claim_once()
+        await delivery.ack()
+        assert await queue.prune_done(timedelta(0), 100) == 1
+        with pytest.raises(NoMessageError):
+            await queue.inspect("delete")
+
+    async def test_id_reuse_replaces_retained_record(self, queue: Queue):
+        queue._options.dedupe_ttl = timedelta(milliseconds=1)
+        await queue.enqueue(Message(payload=b"old"), id="same")
+        delivery = await queue._claim_once()
+        await delivery.ack()
+        await asyncio.sleep(0.01)
+
+        await queue.enqueue(Message(payload=b"new"), id="same")
+        delivery = await queue._claim_once()
+        assert delivery.payload == b"new"
+
+    async def test_reaper_prunes_done_records(self, queue: Queue):
+        from pymq.lifecycle import run_reaper
+
+        queue._options.done_retention_ttl = timedelta(milliseconds=1)
+        await queue.enqueue(Message(payload=b"old"), id="old")
+        delivery = await queue._claim_once()
+        await delivery.ack()
+        await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(run_reaper(queue, timedelta(milliseconds=1)))
+        try:
+            for _ in range(100):
+                try:
+                    await queue.inspect("old")
+                except NoMessageError:
+                    break
+                await asyncio.sleep(0.001)
+            else:
+                pytest.fail("RunReaper did not prune the completed job")
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
 class TestPydanticSerialization:
     """Pydantic models serialize/deserialize through the queue."""
 
@@ -105,6 +191,7 @@ class TestPydanticSerialization:
         d = await queue._claim_once()
         # Raw bytes are JSON
         import json
+
         data = json.loads(d.payload)
         assert data["item"] == "widget"
         assert data["qty"] == 5
@@ -142,7 +229,7 @@ class TestReapExpired:
         # Use a very short visibility timeout
         queue._options.visibility_timeout = timedelta(seconds=1)
         await queue.enqueue(Message(payload=b"will-expire"))
-        d = await queue._claim_once()
+        await queue._claim_once()
         # Wait for lease to expire
         await asyncio.sleep(1.5)
         moved = await queue.reap_expired()

@@ -38,6 +38,8 @@ class EventStatus(str, Enum):
     LOST_OWNERSHIP = "lost_ownership"
     REQUEUE_DLQ = "requeue_dlq"
     DELETE_DLQ = "delete_dlq"
+    DELETE_DONE = "delete_done"
+    PRUNE_DONE = "prune_done"
     OBSERVER_PANIC = "observer_panic"
     HOOK_PANIC = "hook_panic"
 

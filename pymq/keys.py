@@ -16,6 +16,7 @@ class RedisKeys(BaseModel):
     inflight: str
     dlq: str
     done: str
+    dedupe: str
     payloads: str
     headers: str
     states: str
@@ -41,6 +42,7 @@ def make_redis_keys(queue_name: str) -> RedisKeys:
         inflight=f"{tag}:inflight",
         dlq=f"{tag}:dlq",
         done=f"{tag}:done",
+        dedupe=f"{tag}:dedupe",
         payloads=f"{tag}:payloads",
         headers=f"{tag}:headers",
         states=f"{tag}:states",

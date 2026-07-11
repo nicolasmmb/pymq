@@ -18,7 +18,7 @@ from pymq.errors import (
     PermanentError,
     is_permanent,
 )
-from pymq.event import Event, EventStatus, Hooks, Operation, Observer
+from pymq.event import Event, EventStatus, Hooks, Observer, Operation
 from pymq.keys import RedisKeys, make_redis_keys
 from pymq.lifecycle import consume_with_signals, run_reaper
 from pymq.managed import (
@@ -39,7 +39,14 @@ from pymq.middleware import (
     chain_consumer,
     chain_producer,
 )
-from pymq.options import EnqueueOptions, ListOptions, NackOptions, Options, RequeueOptions
+from pymq.options import (
+    AckRetentionPolicy,
+    EnqueueOptions,
+    ListOptions,
+    NackOptions,
+    Options,
+    RequeueOptions,
+)
 from pymq.queue import Queue
 from pymq.state import MessageState, can_transition
 
@@ -50,6 +57,7 @@ __all__ = [
     "Delivery",
     # Options
     "Options",
+    "AckRetentionPolicy",
     "EnqueueOptions",
     "NackOptions",
     "ListOptions",
