@@ -7,18 +7,26 @@ ManagedControl, ListManagedWorkers, Pause/Resume/SetConcurrency.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import socket
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from enum import StrEnum
+from typing import Any, cast
 
 from pymq.errors import InvalidConfigError
 from pymq.event import Event, EventStatus, Operation
 from pymq.middleware import Handler, chain_consumer
 
 MANAGED_WORKER_ALL = "__all__"
+
+
+class ManagedWorkerState(StrEnum):
+    RUNNING = "running"
+    PAUSED = "paused"
 
 
 @dataclass
@@ -45,7 +53,7 @@ class ManagedWorkerInfo:
     queue: str = ""
     hostname: str = ""
     pid: int = 0
-    state: str = "running"
+    state: ManagedWorkerState = ManagedWorkerState.RUNNING
     current_concurrency: int = 0
     desired_concurrency: int = 0
     last_seen_ms: int = 0
@@ -95,15 +103,27 @@ async def run_managed_consumer(
         worker_id = queue._options.consumer_id
     if not worker_id or worker_id == "pymq-consumer":
         worker_id = f"{_hostname()}-{os.getpid()}"
-    if opts.concurrency <= 0:
+    if opts.concurrency == 0:
         opts.concurrency = 1
+    if opts.concurrency < 0:
+        raise InvalidConfigError(
+            op="managed_consume", message="concurrency must be positive"
+        )
     heartbeat_interval = opts.heartbeat_interval or timedelta(seconds=5)
     heartbeat_ttl = opts.heartbeat_ttl or heartbeat_interval * 3
+    if heartbeat_interval <= timedelta(0):
+        raise InvalidConfigError(
+            op="managed_consume", message="heartbeat_interval must be positive"
+        )
+    if heartbeat_ttl <= timedelta(0):
+        raise InvalidConfigError(
+            op="managed_consume", message="heartbeat_ttl must be positive"
+        )
 
     handler = chain_consumer(handler, queue._options.consumer_middlewares)
 
-    managed_ctx = asyncio.Event()
     workers: dict[int, _ManagedWorker] = {}
+    worker_tasks: dict[int, asyncio.Task[None]] = {}
     next_worker_id = 0
     done_queue: asyncio.Queue[int] = asyncio.Queue()
     err_queue: asyncio.Queue[Exception] = asyncio.Queue()
@@ -128,7 +148,9 @@ async def run_managed_consumer(
             wid = next_worker_id
             w = _ManagedWorker()
             workers[wid] = w
-            asyncio.create_task(_run_managed_worker(queue, w.retire, wid, handler, done_queue, err_queue))
+            worker_tasks[wid] = asyncio.create_task(
+                _run_managed_worker(queue, w.retire, wid, handler, done_queue, err_queue)
+            )
 
     def apply_control(control: ManagedControl) -> None:
         nonlocal desired, paused
@@ -139,7 +161,7 @@ async def run_managed_consumer(
         reconcile()
 
     async def heartbeat() -> None:
-        state = "paused" if paused else "running"
+        state = ManagedWorkerState.PAUSED if paused else ManagedWorkerState.RUNNING
         info = ManagedWorkerInfo(
             id=worker_id,
             queue=queue.queue_name,
@@ -148,56 +170,46 @@ async def run_managed_consumer(
             state=state,
             current_concurrency=len(workers),
             desired_concurrency=desired,
-            last_seen_ms=int(asyncio.get_event_loop().time() * 1000),
+            last_seen_ms=int(time.time() * 1000),
         )
         await _heartbeat_managed_worker(queue, info, heartbeat_ttl)
 
     reconcile()
     await heartbeat()
 
-    ticker = asyncio.create_task(_ticker(heartbeat_interval))
-
     try:
-        while not managed_ctx.is_set():
-            done, _, pending = await asyncio.wait(
-                [
-                    asyncio.create_task(done_queue.get()),
-                    asyncio.create_task(err_queue.get()),
-                    asyncio.create_task(ticker),
-                ],
+        while True:
+            worker_done = asyncio.create_task(done_queue.get())
+            worker_error = asyncio.create_task(err_queue.get())
+            ticker = asyncio.create_task(_ticker(heartbeat_interval))
+            done, pending = await asyncio.wait(
+                {worker_done, worker_error, ticker},
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            for task in done:
-                result = task.result()
-                if isinstance(result, int):
-                    workers.pop(result, None)
-                    reconcile()
-                elif isinstance(result, Exception):
-                    raise result
-
             for task in pending:
-                if task is ticker:
-                    pass
-                else:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+                task.cancel()
+            for task in pending:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
+            if worker_error in done:
+                raise worker_error.result()
+            if worker_done in done:
+                stopped_id = worker_done.result()
+                workers.pop(stopped_id, None)
+                task = worker_tasks.pop(stopped_id, None)
+                if task is not None:
+                    await task
+                reconcile()
             if ticker in done:
-                try:
-                    control = await _get_managed_control(queue, worker_id)
-                    apply_control(control)
-                except Exception:
-                    pass
+                control = await _get_managed_control(queue, worker_id)
+                apply_control(control)
                 await heartbeat()
-                ticker = asyncio.create_task(_ticker(heartbeat_interval))
     finally:
-        ticker.cancel()
         for w in workers.values():
             w.stop()
-        while not done_queue.empty():
-            done_queue.get_nowait()
+        await asyncio.gather(*worker_tasks.values(), return_exceptions=True)
 
 
 async def _ticker(interval: timedelta) -> None:
@@ -231,8 +243,22 @@ async def _run_managed_worker(
             if retire_task in done:
                 return
 
-            d = receive_task.result()
-            if d is None:
+            try:
+                d = receive_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as receive_err:
+                from pymq.errors import NoMessageError
+
+                if isinstance(receive_err, NoMessageError):
+                    continue
+                queue._emit(
+                    Event(
+                        operation=Operation.CLAIM,
+                        status=EventStatus.ERROR,
+                        error=receive_err,
+                    )
+                )
                 continue
 
             start = asyncio.get_event_loop().time()
@@ -300,17 +326,21 @@ async def _heartbeat_managed_worker(
             "current_concurrency": info.current_concurrency,
             "desired_concurrency": info.desired_concurrency,
             "last_seen_ms": info.last_seen_ms,
+            "expires_at_ms": info.expires_at_ms,
         }
     )
-    from pymq.queue import _duration_ms
-
-    await queue._eval(
+    result = await queue._eval(
         "worker_heartbeat",
         [queue._keys.workers, queue._keys.worker_info],
         info.id,
         body,
-        _duration_ms(ttl),
+        int(ttl.total_seconds() * 1000),
     )
+    if not isinstance(result, (list, tuple)):
+        raise RuntimeError(f"pymq: unexpected worker heartbeat result {result!r}")
+    values = cast(list[Any] | tuple[Any, ...], result)
+    if len(values) < 3:
+        raise RuntimeError(f"pymq: unexpected worker heartbeat result {result!r}")
 
 
 async def _get_managed_control(queue: Any, worker_id: str) -> ManagedControl:
@@ -321,36 +351,33 @@ async def _get_managed_control(queue: Any, worker_id: str) -> ManagedControl:
         worker_id,
         MANAGED_WORKER_ALL,
     )
-    if not isinstance(result, (list, tuple)) or len(result) < 2:
-        return ManagedControl()
+    if not isinstance(result, (list, tuple)):
+        raise RuntimeError(f"pymq: unexpected worker control result {result!r}")
+    values = cast(list[Any] | tuple[Any, ...], result)
+    if len(values) < 2:
+        raise RuntimeError(f"pymq: unexpected worker control result {result!r}")
 
-    global_json = _to_str(result[0])
-    specific_json = _to_str(result[1])
+    global_json = _to_str(values[0])
+    specific_json = _to_str(values[1])
 
     control = ManagedControl()
     if global_json:
-        try:
-            data = json.loads(global_json)
-            if "paused" in data:
-                control.paused = data["paused"]
-            if "concurrency" in data:
-                control.concurrency = data["concurrency"]
-            if "updated_at_ms" in data:
-                control.updated_at_ms = data["updated_at_ms"]
-        except (json.JSONDecodeError, TypeError):
-            pass
+        data = json.loads(global_json)
+        if "paused" in data:
+            control.paused = data["paused"]
+        if "concurrency" in data:
+            control.concurrency = data["concurrency"]
+        if "updated_at_ms" in data:
+            control.updated_at_ms = data["updated_at_ms"]
 
     if specific_json:
-        try:
-            data = json.loads(specific_json)
-            if "paused" in data:
-                control.paused = data["paused"]
-            if "concurrency" in data:
-                control.concurrency = data["concurrency"]
-            if "updated_at_ms" in data and data["updated_at_ms"] > control.updated_at_ms:
-                control.updated_at_ms = data["updated_at_ms"]
-        except (json.JSONDecodeError, TypeError):
-            pass
+        data = json.loads(specific_json)
+        if "paused" in data:
+            control.paused = data["paused"]
+        if "concurrency" in data:
+            control.concurrency = data["concurrency"]
+        if "updated_at_ms" in data and data["updated_at_ms"] > control.updated_at_ms:
+            control.updated_at_ms = data["updated_at_ms"]
 
     return control
 
@@ -384,23 +411,28 @@ async def list_managed_workers(queue: Any) -> list[ManagedWorkerInfo]:
         [queue._keys.workers, queue._keys.worker_info],
     )
     if not isinstance(result, (list, tuple)):
-        return []
+        raise RuntimeError(f"pymq: unexpected worker list result {result!r}")
+    rows = cast(list[Any] | tuple[Any, ...], result)
 
     workers: list[ManagedWorkerInfo] = []
-    for row in result:
-        if not isinstance(row, (list, tuple)) or len(row) < 3:
-            continue
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
+            raise RuntimeError(f"pymq: unexpected worker list row {row!r}")
+        values = cast(list[Any] | tuple[Any, ...], row)
+        if len(values) < 3:
+            raise RuntimeError(f"pymq: unexpected worker list row {row!r}")
         info = ManagedWorkerInfo()
-        raw = _to_str(row[2])
+        raw = _to_str(values[2])
         if raw:
-            try:
-                data = json.loads(raw)
-                info = ManagedWorkerInfo(**data)
-            except (json.JSONDecodeError, TypeError):
-                pass
+            data = json.loads(raw)
+            info = ManagedWorkerInfo(**data)
         if not info.id:
-            info.id = _to_str(row[0])
-        info.expires_at_ms = int(row[1]) if isinstance(row[1], (int, float)) else int(_to_str(row[1]))
+            info.id = _to_str(values[0])
+        info.expires_at_ms = (
+            int(values[1])
+            if isinstance(values[1], (int, float))
+            else int(_to_str(values[1]))
+        )
         workers.append(info)
     return workers
 
@@ -410,13 +442,14 @@ async def pause_managed_workers(queue: Any, target: str = MANAGED_WORKER_ALL) ->
 
     Corresponds to gomq/managed.go PauseManagedWorkers().
     """
-    control = json.dumps({"paused": True, "updated_at_ms": int(asyncio.get_event_loop().time() * 1000)})
-    await queue._eval(
+    control = json.dumps({"paused": True, "updated_at_ms": int(time.time() * 1000)})
+    result = await queue._eval(
         "worker_control_set",
         [queue._keys.worker_controls],
         target or MANAGED_WORKER_ALL,
         control,
     )
+    _validate_control_result(result)
 
 
 async def resume_managed_workers(queue: Any, target: str = MANAGED_WORKER_ALL) -> None:
@@ -424,13 +457,14 @@ async def resume_managed_workers(queue: Any, target: str = MANAGED_WORKER_ALL) -
 
     Corresponds to gomq/managed.go ResumeManagedWorkers().
     """
-    control = json.dumps({"paused": False, "updated_at_ms": int(asyncio.get_event_loop().time() * 1000)})
-    await queue._eval(
+    control = json.dumps({"paused": False, "updated_at_ms": int(time.time() * 1000)})
+    result = await queue._eval(
         "worker_control_set",
         [queue._keys.worker_controls],
         target or MANAGED_WORKER_ALL,
         control,
     )
+    _validate_control_result(result)
 
 
 async def set_managed_concurrency(
@@ -441,13 +475,21 @@ async def set_managed_concurrency(
     Corresponds to gomq/managed.go SetManagedConcurrency().
     """
     if concurrency <= 0:
-        raise InvalidConfigError(op="worker_set_concurrency", message="concurrency must be positive")
+        raise InvalidConfigError(
+            op="worker_set_concurrency", message="concurrency must be positive"
+        )
     control = json.dumps(
-        {"concurrency": concurrency, "updated_at_ms": int(asyncio.get_event_loop().time() * 1000)}
+        {"concurrency": concurrency, "updated_at_ms": int(time.time() * 1000)}
     )
-    await queue._eval(
+    result = await queue._eval(
         "worker_control_set",
         [queue._keys.worker_controls],
         target or MANAGED_WORKER_ALL,
         control,
     )
+    _validate_control_result(result)
+
+
+def _validate_control_result(result: Any) -> None:
+    if not isinstance(result, (list, tuple)) or not result or _to_str(result[0]) != "ok":
+        raise RuntimeError(f"pymq: unexpected worker control result {result!r}")

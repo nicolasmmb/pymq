@@ -5,10 +5,10 @@ Corresponds to gomq/state.go — MessageState enum and canTransition().
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class MessageState(str, Enum):
+class MessageState(StrEnum):
     READY = "ready"
     PROCESSING = "processing"
     DONE = "done"
@@ -26,7 +26,10 @@ def can_transition(from_state: MessageState | str, to_state: MessageState | str)
         dlq -> (none)
     """
     # Handle empty string as a special "unset" state (before first enqueue)
-    f = from_state if isinstance(from_state, MessageState) else MessageState(from_state) if from_state else ""
+    if isinstance(from_state, MessageState):
+        f = from_state
+    else:
+        f = MessageState(from_state) if from_state else ""
     t = to_state if isinstance(to_state, MessageState) else MessageState(to_state)
 
     if f == "":
@@ -34,7 +37,12 @@ def can_transition(from_state: MessageState | str, to_state: MessageState | str)
     if f == MessageState.READY:
         return t == MessageState.PROCESSING
     if f == MessageState.PROCESSING:
-        return t in (MessageState.READY, MessageState.DONE, MessageState.DLQ, MessageState.PROCESSING)
+        return t in (
+            MessageState.READY,
+            MessageState.DONE,
+            MessageState.DLQ,
+            MessageState.PROCESSING,
+        )
     if f in (MessageState.DONE, MessageState.DLQ):
         return False
     return False

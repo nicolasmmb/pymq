@@ -41,9 +41,9 @@ class TestOptions:
         with pytest.raises(InvalidConfigError):
             Options(queue_name="")
 
-    def test_zero_visibility_timeout_fails(self):
-        with pytest.raises(InvalidConfigError):
-            Options(queue_name="q1", visibility_timeout=timedelta(0))
+    def test_zero_visibility_timeout_uses_default(self):
+        opts = Options(queue_name="q1", visibility_timeout=timedelta(0))
+        assert opts.visibility_timeout == timedelta(seconds=30)
 
     def test_negative_poll_timeout_fails(self):
         with pytest.raises(InvalidConfigError):
@@ -80,3 +80,22 @@ class TestOptions:
             done_retention_ttl=timedelta(hours=1),
         )
         assert queue._options.done_retention_ttl == timedelta(hours=1)
+
+    def test_explicit_zero_values_use_go_defaults(self):
+        opts = Options(
+            queue_name="q1",
+            visibility_timeout=timedelta(0),
+            poll_timeout=timedelta(0),
+            poll_interval=timedelta(0),
+            heartbeat_interval=timedelta(0),
+            dedupe_ttl=timedelta(0),
+            max_attempts=0,
+            consumer_id="",
+        )
+        assert opts.visibility_timeout == timedelta(seconds=30)
+        assert opts.poll_timeout == timedelta(seconds=1)
+        assert opts.poll_interval == timedelta(milliseconds=50)
+        assert opts.heartbeat_interval == timedelta(seconds=10)
+        assert opts.dedupe_ttl == timedelta(hours=24)
+        assert opts.max_attempts == 3
+        assert opts.consumer_id == "pymq-consumer"

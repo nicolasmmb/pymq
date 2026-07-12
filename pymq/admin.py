@@ -6,9 +6,10 @@ Corresponds to gomq/admin.go — Stats, MessageInfo, ListOptions, parsers.
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 from pymq.errors import NoMessageError
 from pymq.state import MessageState
@@ -38,7 +39,7 @@ class MessageInfo:
 
     id: str = ""
     payload: bytes = b""
-    headers: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=lambda: {})
     state: MessageState = MessageState.READY
     attempts: int = 0
     lease_until_ms: int = 0
@@ -56,17 +57,20 @@ def parse_stats(result: Any) -> Stats:
 
     Mirrors gomq/admin.go parseStats().
     """
-    if not isinstance(result, (list, tuple)) or len(result) < 4:
+    if not isinstance(result, (list, tuple)):
+        raise ValueError(f"unexpected stats result {result!r}")
+    values = cast(list[Any] | tuple[Any, ...], result)
+    if len(values) < 4:
         raise ValueError(f"unexpected stats result {result!r}")
     stats = Stats(
-        ready=_to_int(result[0]),
-        inflight=_to_int(result[1]),
-        dlq=_to_int(result[2]),
-        done=_to_int(result[3]),
+        ready=_to_int(values[0]),
+        inflight=_to_int(values[1]),
+        dlq=_to_int(values[2]),
+        done=_to_int(values[3]),
     )
-    if len(result) >= 6:
-        stats.oldest_ready_age = timedelta(milliseconds=_to_int(result[4]))
-        stats.oldest_dlq_age = timedelta(milliseconds=_to_int(result[5]))
+    if len(values) >= 6:
+        stats.oldest_ready_age = timedelta(milliseconds=_to_int(values[4]))
+        stats.oldest_dlq_age = timedelta(milliseconds=_to_int(values[5]))
     return stats
 
 
@@ -77,12 +81,13 @@ def parse_message_info(result: Any) -> MessageInfo:
     """
     if not isinstance(result, (list, tuple)):
         raise ValueError(f"unexpected message info result {result!r}")
-    status = _to_str(result[0])
+    values = cast(list[Any] | tuple[Any, ...], result)
+    status = _to_str(values[0])
     if status != "ok":
         raise NoMessageError()
-    if len(result) < 10:
+    if len(values) < 10:
         raise ValueError(f"unexpected message info result {result!r}")
-    return _parse_message_info_fields(result[1:10])
+    return _parse_message_info_fields(values[1:10])
 
 
 def parse_message_info_list(result: Any) -> list[MessageInfo]:
@@ -92,15 +97,19 @@ def parse_message_info_list(result: Any) -> list[MessageInfo]:
     """
     if not isinstance(result, (list, tuple)):
         raise ValueError(f"unexpected dlq list result {result!r}")
+    rows = cast(list[Any] | tuple[Any, ...], result)
     out: list[MessageInfo] = []
-    for row in result:
-        if not isinstance(row, (list, tuple)) or len(row) < 8:
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
             raise ValueError(f"unexpected dlq row {row!r}")
-        out.append(_parse_message_info_fields(row))
+        values = cast(list[Any] | tuple[Any, ...], row)
+        if len(values) < 8:
+            raise ValueError(f"unexpected dlq row {row!r}")
+        out.append(_parse_message_info_fields(values))
     return out
 
 
-def _parse_message_info_fields(values: tuple | list) -> MessageInfo:
+def _parse_message_info_fields(values: list[Any] | tuple[Any, ...]) -> MessageInfo:
     """Parse message info fields from a Lua result array.
 
     Mirrors gomq/admin.go parseMessageInfoFields().
@@ -120,10 +129,8 @@ def _parse_message_info_fields(values: tuple | list) -> MessageInfo:
         info.done_score = _to_float(values[8])
     raw_headers = _to_str(values[2])
     if raw_headers:
-        try:
+        with suppress(json.JSONDecodeError, TypeError):
             info.headers = json.loads(raw_headers)
-        except (json.JSONDecodeError, TypeError):
-            pass
     return info
 
 

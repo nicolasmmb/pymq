@@ -7,17 +7,18 @@ ack, nack, extend, ReapExpired, eval, evalSha, loadScripts, helpers.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
-import logging
-import socket
+import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import TYPE_CHECKING, Any, cast, get_type_hints
 
 from pydantic import TypeAdapter
 from redis.asyncio import Redis
+from redis.exceptions import NoScriptError
 
 from pymq.admin import (
     MessageInfo,
@@ -44,9 +45,11 @@ from pymq.options import (
     AckRetentionPolicy,
     ListOptions,
     Options,
+    RequeueOptions,
 )
 
-logger = logging.getLogger("pymq")
+if TYPE_CHECKING:
+    from pymq.managed import ManagedConsumerOptions, ManagedWorkerInfo
 
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
 SCRIPT_NAMES = [
@@ -92,19 +95,7 @@ def _is_no_script(err: Exception) -> bool:
 
     Mirrors gomq/queue.go isNoScript().
     """
-    return "NOSCRIPT" in str(err).upper()
-
-
-def _hostname() -> str:
-    """Get hostname, fallback to 'pymq-worker'.
-
-    Mirrors gomq/managed.go hostname().
-    """
-    try:
-        name = socket.gethostname()
-        return name if name else "pymq-worker"
-    except Exception:
-        return "pymq-worker"
+    return isinstance(err, NoScriptError) or "NOSCRIPT" in str(err).upper()
 
 
 def _first_script_status(result: Any) -> str:
@@ -112,8 +103,11 @@ def _first_script_status(result: Any) -> str:
 
     Mirrors gomq/queue.go firstScriptStatus().
     """
-    if isinstance(result, (list, tuple)) and len(result) > 0:
-        v = result[0]
+    if isinstance(result, (list, tuple)):
+        values = cast(list[Any] | tuple[Any, ...], result)
+        if not values:
+            return ""
+        v = values[0]
         return v.decode() if isinstance(v, bytes) else str(v)
     if isinstance(result, bytes):
         return result.decode()
@@ -133,21 +127,10 @@ def _to_int(v: Any) -> int:
         return int(v)
     if isinstance(v, str):
         return int(v)
-    if isinstance(v, (list, tuple)) and len(v) > 0:
-        return _to_int(v[0])
+    if isinstance(v, (list, tuple)):
+        values = cast(list[Any] | tuple[Any, ...], v)
+        return _to_int(values[0]) if values else 0
     return 0
-
-
-def _to_float(v: Any) -> float:
-    """Coerce Redis response to float.
-
-    Mirrors gomq/admin.go toFloat().
-    """
-    if isinstance(v, float):
-        return v
-    if isinstance(v, (int, bytes, str)):
-        return float(v)
-    return 0.0
 
 
 def _to_str(v: Any) -> str:
@@ -178,7 +161,7 @@ class Queue:
     Corresponds to gomq/queue.go Queue struct.
     """
 
-    def __init__(self, client: Redis, **kwargs: Any) -> None:
+    def __init__(self, client: Redis | None, **kwargs: Any) -> None:
         if client is None:
             raise InvalidConfigError(op="new", message="redis client is required")
         opts_kwargs = {k: v for k, v in kwargs.items() if k in Options.__dataclass_fields__}
@@ -201,15 +184,15 @@ class Queue:
     def queue_name(self) -> str:
         return self._options.queue_name
 
-    async def _ensure_scripts(self) -> None:
+    async def _ensure_scripts(self, *, force: bool = False) -> None:
         """Load all Lua scripts into Redis, caching their SHA hashes.
 
         Mirrors gomq/queue.go loadScripts().
         """
-        if self._loaded:
+        if self._loaded and not force:
             return
         async with self._lock:
-            if self._loaded:
+            if self._loaded and not force:
                 return
             loaded: dict[str, str] = {}
             for name in SCRIPT_NAMES:
@@ -232,7 +215,7 @@ class Queue:
             return result
         except Exception as e:
             if _is_no_script(e):
-                await self._ensure_scripts()
+                await self._ensure_scripts(force=True)
                 sha = self._scripts[name]
                 return await self._client.evalsha(sha, len(keys), *keys, *args)
             raise
@@ -248,9 +231,11 @@ class Queue:
 
         # Observer
         try:
-            self._options.observer.observe(event)
+            observer = self._options.observer
+            if observer is not None:
+                observer.observe(event)
         except Exception as recovered:
-            try:
+            with contextlib.suppress(Exception):
                 self._emit_hook(
                     Event(
                         operation=event.operation,
@@ -261,15 +246,15 @@ class Queue:
                         error=Exception(f"pymq: observer panic: {recovered}"),
                     )
                 )
-            except Exception:
-                pass
 
         # Hook
         self._emit_hook(event)
 
     def _emit_hook(self, event: Event) -> None:
         """Dispatch to the appropriate hook callback."""
-        hooks: Hooks = self._options.hooks
+        hooks = self._options.hooks
+        if hooks is None:
+            return
         hook = None
         if event.error is not None:
             hook = hooks.on_error
@@ -287,7 +272,7 @@ class Queue:
             hook(event)
         except Exception as recovered:
             if event.error is None and hooks.on_error is not None:
-                try:
+                with contextlib.suppress(Exception):
                     hooks.on_error(
                         Event(
                             operation=event.operation,
@@ -298,14 +283,12 @@ class Queue:
                             error=Exception(f"pymq: hook panic: {recovered}"),
                         )
                     )
-                except Exception:
-                    pass
 
     # --- Public API ---
 
     async def enqueue(
         self,
-        msg: Message,
+        msg: Message[Any],
         *,
         id: str = "",
         delay: timedelta | None = None,
@@ -323,7 +306,7 @@ class Queue:
 
     async def _enqueue(
         self,
-        msg: Message,
+        msg: Message[Any],
         *,
         id: str = "",
         delay: timedelta | None = None,
@@ -494,10 +477,16 @@ class Queue:
         )
 
         status = _first_script_status(result)
-        if status == "none" or not isinstance(result, (list, tuple)) or len(result) == 0:
+        if status == "none":
             raise NoMessageError()
-
-        if status != "ok" or len(result) < 7:
+        values = (
+            cast(list[Any] | tuple[Any, ...], result)
+            if isinstance(result, (list, tuple))
+            else []
+        )
+        if not values:
+            raise NoMessageError()
+        if status != "ok" or len(values) < 7:
             err = GomqError(
                 code=ErrorCode.UNEXPECTED,
                 op="claim",
@@ -516,24 +505,27 @@ class Queue:
 
         # Parse headers
         headers: dict[str, str] = {}
-        raw_headers = _to_str(result[3]) if len(result) > 3 else ""
+        raw_headers = _to_str(values[3]) if len(values) > 3 else ""
         if raw_headers and raw_headers != "null":
             try:
-                headers = json.loads(raw_headers)
+                headers = cast(dict[str, str], json.loads(raw_headers))
             except (json.JSONDecodeError, TypeError):
                 headers = {}
 
+        raw_payload = values[2]
         d = Delivery[bytes](
-            id=_to_str(result[1]),
-            payload=(_to_str(result[2])).encode()
-            if isinstance(result[2], str)
-            else (result[2] or b""),
+            id=_to_str(values[1]),
+            payload=(
+                raw_payload
+                if isinstance(raw_payload, bytes)
+                else _to_str(raw_payload).encode()
+            ),
             headers=headers,
-            token=_to_str(result[6]),
-            attempts=_to_int(result[4]),
-            lease_until_ms=_to_int(result[5]),
+            token=_to_str(values[6]),
+            attempts=_to_int(values[4]),
+            lease_until_ms=_to_int(values[5]),
             _queue=self,
-            _enqueued_at_ms=_to_int(result[7]) if len(result) >= 8 else 0,
+            _enqueued_at_ms=_to_int(values[7]) if len(values) >= 8 else 0,
         )
 
         self._emit(
@@ -585,7 +577,7 @@ class Queue:
                 duration=duration,
             )
             if enqueued_at_ms > 0:
-                e2e_ms = int(asyncio.get_event_loop().time() * 1000) - enqueued_at_ms
+                e2e_ms = int(time.time() * 1000) - enqueued_at_ms
                 if e2e_ms > 0:
                     event.end_to_end_duration = timedelta(milliseconds=e2e_ms)
             self._emit(event)
@@ -643,7 +635,9 @@ class Queue:
         start = asyncio.get_event_loop().time()
 
         if backoff is None:
-            backoff = self._options.retry_backoff(attempt)
+            retry_backoff = self._options.retry_backoff
+            assert retry_backoff is not None
+            backoff = retry_backoff(attempt)
 
         if backoff < timedelta(0):
             err = InvalidConfigError(op="nack", message="retry_backoff returned negative duration")
@@ -844,10 +838,9 @@ class Queue:
         payload_type = self._extract_payload_type(handler)
 
         # Build deserializer
-        if payload_type is bytes:
-            adapter = None
-        else:
-            adapter = TypeAdapter(payload_type)
+        adapter: TypeAdapter[Any] | None = (
+            None if payload_type is bytes else TypeAdapter(payload_type)
+        )
 
         # Wrap handler to auto-deserialize
         async def raw_handler(raw: Delivery[bytes]) -> None:
@@ -855,16 +848,16 @@ class Queue:
                 raw_bytes = raw.payload
                 if isinstance(raw_bytes, str):
                     raw_bytes = raw_bytes.encode()
-                typed_payload = adapter.validate_json(raw_bytes)
-                typed_delivery = Delivery(
+                typed_payload: Any = adapter.validate_json(raw_bytes)
+                typed_delivery = Delivery[Any](
                     id=raw.id,
                     payload=typed_payload,
                     headers=raw.headers,
                     token=raw.token,
                     attempts=raw.attempts,
                     lease_until_ms=raw.lease_until_ms,
-                    _queue=raw._queue,
-                    _enqueued_at_ms=raw._enqueued_at_ms,
+                    _queue=raw._queue,  # pyright: ignore[reportPrivateUsage]
+                    _enqueued_at_ms=raw._enqueued_at_ms,  # pyright: ignore[reportPrivateUsage]
                 )
                 await handler(typed_delivery)
             else:
@@ -880,13 +873,13 @@ class Queue:
             task = asyncio.create_task(self._worker_loop(i, wrapped, stop))
             tasks.append(task)
 
-        # Wait until cancelled
         try:
             await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
+        finally:
             stop.set()
             for t in tasks:
-                t.cancel()
+                if not t.done():
+                    t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _worker_loop(self, worker_id: int, handler: Handler, stop: asyncio.Event) -> None:
@@ -905,19 +898,6 @@ class Queue:
             start = asyncio.get_event_loop().time()
             try:
                 await handler(d)
-                self._emit(
-                    Event(
-                        operation=Operation.HANDLER,
-                        status=EventStatus.OK,
-                        message_id=d.id,
-                        attempt=d.attempts,
-                        duration=timedelta(seconds=asyncio.get_event_loop().time() - start),
-                    )
-                )
-                try:
-                    await d.ack()
-                except Exception:
-                    return
             except Exception as handler_err:
                 self._emit(
                     Event(
@@ -938,15 +918,24 @@ class Queue:
                         error=handler_err,
                     )
                 )
-                try:
-                    from pymq.errors import is_permanent
+                from pymq.errors import is_permanent
 
-                    nack_kwargs: dict[str, Any] = {"error": handler_err}
-                    if is_permanent(handler_err):
-                        nack_kwargs["permanent"] = True
-                    await d.nack(**nack_kwargs)
-                except Exception:
-                    return
+                nack_kwargs: dict[str, Any] = {"error": handler_err}
+                if is_permanent(handler_err):
+                    nack_kwargs["permanent"] = True
+                await d.nack(**nack_kwargs)
+                continue
+
+            self._emit(
+                Event(
+                    operation=Operation.HANDLER,
+                    status=EventStatus.OK,
+                    message_id=d.id,
+                    attempt=d.attempts,
+                    duration=timedelta(seconds=asyncio.get_event_loop().time() - start),
+                )
+            )
+            await d.ack()
 
     async def reap_expired(self, limit: int = 100) -> int:
         """Reclaim expired in-flight messages.
@@ -959,7 +948,9 @@ class Queue:
             limit = 100
 
         start = asyncio.get_event_loop().time()
-        backoff = self._options.retry_backoff(self._options.max_attempts)
+        retry_backoff = self._options.retry_backoff
+        assert retry_backoff is not None
+        backoff = retry_backoff(self._options.max_attempts)
 
         result = await self._eval(
             "reap_expired",
@@ -980,7 +971,11 @@ class Queue:
 
         duration = timedelta(seconds=asyncio.get_event_loop().time() - start)
 
-        values = result if isinstance(result, (list, tuple)) else [result]
+        values: list[Any] | tuple[Any, ...] = (
+            cast(list[Any] | tuple[Any, ...], result)
+            if isinstance(result, (list, tuple))
+            else [result]
+        )
         moved = _to_int(values[0]) if len(values) > 0 else 0
         retried = _to_int(values[1]) if len(values) > 2 else 0
         dead = _to_int(values[2]) if len(values) > 2 else 0
@@ -1049,6 +1044,70 @@ class Queue:
         )
         return parse_message_info_list(result)
 
+    async def list_dlq(self, options: ListOptions | None = None) -> list[MessageInfo]:
+        """List dead-lettered jobs."""
+        offset, count = self._list_options(options)
+        result = await self._eval(
+            "list_dlq",
+            [
+                self._keys.dlq,
+                self._keys.payloads,
+                self._keys.headers,
+                self._keys.states,
+                self._keys.attempts,
+                self._keys.leases,
+                self._keys.errors,
+            ],
+            offset,
+            count,
+        )
+        return parse_message_info_list(result)
+
+    async def requeue_dlq(self, id: str, options: RequeueOptions | None = None) -> None:
+        """Move a dead-lettered job back to ready."""
+        options = options or RequeueOptions()
+        if options.delay < timedelta(0):
+            raise InvalidConfigError(op="requeue_dlq", message="delay cannot be negative")
+        result = await self._eval(
+            "requeue_dlq",
+            [
+                self._keys.ready,
+                self._keys.dlq,
+                self._keys.states,
+                self._keys.attempts,
+                self._keys.tokens,
+                self._keys.leases,
+                self._keys.errors,
+            ],
+            id,
+            _duration_ms(options.delay),
+            "1" if options.reset_attempts else "0",
+        )
+        if _first_script_status(result) != "ok":
+            raise NoMessageError()
+        self._emit(Event(operation=Operation.ADMIN, status=EventStatus.REQUEUE_DLQ, message_id=id))
+
+    async def delete_dlq(self, id: str) -> None:
+        """Delete a dead-lettered job and its stored data."""
+        result = await self._eval(
+            "delete_dlq",
+            [
+                self._keys.dlq,
+                self._keys.payloads,
+                self._keys.headers,
+                self._keys.states,
+                self._keys.attempts,
+                self._keys.tokens,
+                self._keys.leases,
+                self._keys.errors,
+                self._keys.metadata,
+            ],
+            id,
+        )
+        if _first_script_status(result) != "ok":
+            raise NoMessageError()
+        self._emit(Event(operation=Operation.ADMIN, status=EventStatus.DELETE_DLQ, message_id=id))
+
     async def delete_done(self, id: str) -> None:
         """Delete a completed record and immediately release its ID."""
         result = await self._eval(
@@ -1075,7 +1134,9 @@ class Queue:
         """Delete completed records older than ``older_than``."""
         if older_than < timedelta(0):
             raise InvalidConfigError(op="prune_done", message="older_than cannot be negative")
-        limit = min(max(limit, 1), 1000)
+        if limit <= 0:
+            limit = 100
+        limit = min(limit, 1000)
         result = await self._eval(
             "prune_done",
             [
@@ -1095,12 +1156,62 @@ class Queue:
         self._emit(Event(operation=Operation.ADMIN, status=EventStatus.PRUNE_DONE))
         return _to_int(result)
 
+    async def run_reaper(self, interval: timedelta, limit: int = 100) -> None:
+        """Continuously reclaim expired jobs and prune retained completions."""
+        from pymq.lifecycle import run_reaper
+
+        await run_reaper(self, interval, limit)
+
+    async def consume_with_signals(
+        self,
+        concurrency: int,
+        handler: Handler,
+        signals: list[int] | None = None,
+    ) -> None:
+        """Consume until cancelled or one of the configured signals arrives."""
+        from pymq.lifecycle import consume_with_signals
+
+        await consume_with_signals(self, concurrency, handler, signals)
+
+    async def run_managed_consumer(
+        self, opts: ManagedConsumerOptions, handler: Handler
+    ) -> None:
+        """Run a consumer pool controlled through Redis."""
+        from pymq.managed import run_managed_consumer
+
+        await run_managed_consumer(self, opts, handler)
+
+    async def list_managed_workers(self) -> list[ManagedWorkerInfo]:
+        """List live managed workers for this queue."""
+        from pymq.managed import list_managed_workers
+
+        return await list_managed_workers(self)
+
+    async def pause_managed_workers(self, target: str = "__all__") -> None:
+        """Pause one managed worker or all managed workers."""
+        from pymq.managed import pause_managed_workers
+
+        await pause_managed_workers(self, target)
+
+    async def resume_managed_workers(self, target: str = "__all__") -> None:
+        """Resume one managed worker or all managed workers."""
+        from pymq.managed import resume_managed_workers
+
+        await resume_managed_workers(self, target)
+
+    async def set_managed_concurrency(self, concurrency: int, target: str = "__all__") -> None:
+        """Set desired concurrency for one managed worker or all workers."""
+        from pymq.managed import set_managed_concurrency
+
+        await set_managed_concurrency(self, concurrency, target)
+
     @staticmethod
     def _list_options(options: ListOptions | None) -> tuple[int, int]:
         options = options or ListOptions()
         if options.offset < 0:
             raise InvalidConfigError(op="list", message="offset cannot be negative")
-        return options.offset, min(max(options.count, 1), 1000)
+        count = options.count if options.count > 0 else 100
+        return options.offset, min(count, 1000)
 
     def _extract_payload_type(self, handler: Handler) -> type:
         """Extract T from Delivery[T] in handler's type annotation.

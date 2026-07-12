@@ -18,13 +18,15 @@ from pymq.errors import (
     PermanentError,
     is_permanent,
 )
-from pymq.event import Event, EventStatus, Hooks, Observer, Operation
+from pymq.event import Event, EventStatus, Hooks, Observer, ObserverFunc, Operation
 from pymq.keys import RedisKeys, make_redis_keys
 from pymq.lifecycle import consume_with_signals, run_reaper
 from pymq.managed import (
+    MANAGED_WORKER_ALL,
     ManagedConsumerOptions,
     ManagedControl,
     ManagedWorkerInfo,
+    ManagedWorkerState,
     list_managed_workers,
     pause_managed_workers,
     resume_managed_workers,
@@ -79,6 +81,7 @@ __all__ = [
     "Operation",
     "Hooks",
     "Observer",
+    "ObserverFunc",
     # State
     "MessageState",
     "can_transition",
@@ -100,7 +103,9 @@ __all__ = [
     # Managed
     "ManagedConsumerOptions",
     "ManagedWorkerInfo",
+    "ManagedWorkerState",
     "ManagedControl",
+    "MANAGED_WORKER_ALL",
     "run_managed_consumer",
     "list_managed_workers",
     "pause_managed_workers",

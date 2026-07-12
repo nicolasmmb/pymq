@@ -8,9 +8,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, Generic, TypeVar
+from typing import Generic, Protocol, TypeVar, cast
 
 T = TypeVar("T")
+
+
+class _QueueProtocol(Protocol):
+    async def ack(self, id: str, token: str, enqueued_at_ms: int = 0) -> None: ...
+
+    async def nack(
+        self,
+        id: str,
+        token: str,
+        attempt: int,
+        *,
+        permanent: bool = False,
+        backoff: timedelta | None = None,
+        error: Exception | None = None,
+    ) -> None: ...
+
+    async def extend(self, id: str, token: str, timeout: timedelta) -> None: ...
 
 
 @dataclass
@@ -25,8 +42,8 @@ class Message(Generic[T]):
     """
 
     id: str = ""
-    payload: Any = b""
-    headers: dict[str, str] = field(default_factory=dict)
+    payload: T = field(default_factory=lambda: cast(T, b""))
+    headers: dict[str, str] = field(default_factory=lambda: {})
     delay: timedelta = field(default_factory=timedelta)
 
 
@@ -40,12 +57,12 @@ class Delivery(Generic[T]):
     The queue reference is used internally for ack/nack/extend operations.
     """
 
-    _queue: Any = field(default=None, repr=False)
+    _queue: _QueueProtocol | None = field(default=None, repr=False)
     _enqueued_at_ms: int = field(default=0, repr=False)
 
     id: str = ""
-    payload: Any = None
-    headers: dict[str, str] = field(default_factory=dict)
+    payload: T = field(default_factory=lambda: cast(T, None))
+    headers: dict[str, str] = field(default_factory=lambda: {})
     token: str = ""
     attempts: int = 0
     lease_until_ms: int = 0

@@ -32,6 +32,8 @@ if state ~= false and state ~= "done" then
 	return {"duplicate", id}
 end
 
+-- Existing installations used done as the dedupe index. Honor an unexpired
+-- legacy marker once, then let the new dedupe index own future checks.
 if done_score ~= false and state == false and dedupe_ttl_ms > 0 and tonumber(done_score) > now - dedupe_ttl_ms then
 	return {"done", id}
 end

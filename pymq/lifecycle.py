@@ -6,6 +6,7 @@ Corresponds to gomq/lifecycle.go — RunReaper, ConsumeWithSignals.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 from datetime import timedelta
 from typing import Any
@@ -59,27 +60,26 @@ async def consume_with_signals(
         stop.set()
 
     for sig in signals:
-        try:
+        with contextlib.suppress(NotImplementedError, OSError):
             loop.add_signal_handler(sig, _signal_handler)
-        except (NotImplementedError, OSError):
-            pass  # Windows doesn't support add_signal_handler
 
-    task = asyncio.create_task(queue.consume(concurrency, handler))
-
-    # Wait for stop signal or task completion
-    done, _pending = await asyncio.wait(
-        [asyncio.create_task(stop.wait()), task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-
-    # Cancel remaining
-    for t in _pending:
-        t.cancel()
-    await asyncio.gather(*_pending, return_exceptions=True)
-
-    # Remove signal handlers
-    for sig in signals:
-        try:
-            loop.remove_signal_handler(sig)
-        except (NotImplementedError, OSError):
-            pass
+    stop_task = asyncio.create_task(stop.wait())
+    consume_task = asyncio.create_task(queue.consume(concurrency, handler))
+    try:
+        done, pending = await asyncio.wait(
+            {stop_task, consume_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if consume_task in done:
+            await consume_task
+    finally:
+        for task in (stop_task, consume_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(stop_task, consume_task, return_exceptions=True)
+        for sig in signals:
+            with contextlib.suppress(NotImplementedError, OSError):
+                loop.remove_signal_handler(sig)

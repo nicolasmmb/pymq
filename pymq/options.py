@@ -9,9 +9,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
-from typing import Any
 
 from pymq.errors import InvalidConfigError
+from pymq.event import Hooks, Observer
+from pymq.middleware import ConsumerMiddleware, ProducerMiddleware
 
 
 def default_backoff(attempt: int) -> timedelta:
@@ -53,18 +54,30 @@ class Options:
     retry_backoff: Callable[[int], timedelta] | None = None
 
     # Observability
-    hooks: Any = None  # Hooks
-    observer: Any = None  # Observer
+    hooks: Hooks | None = None
+    observer: Observer | None = None
 
     # Middlewares
-    consumer_middlewares: list[Any] = field(default_factory=list)
-    producer_middlewares: list[Any] = field(default_factory=list)
+    consumer_middlewares: list[ConsumerMiddleware] = field(default_factory=lambda: [])
+    producer_middlewares: list[ProducerMiddleware] = field(default_factory=lambda: [])
 
     def __post_init__(self) -> None:
         if not self.queue_name:
             raise InvalidConfigError(op="options", message="queue_name is required")
-        if self.heartbeat_interval is None:
+        if self.visibility_timeout == timedelta(0):
+            self.visibility_timeout = timedelta(seconds=30)
+        if self.poll_timeout == timedelta(0):
+            self.poll_timeout = timedelta(seconds=1)
+        if self.poll_interval == timedelta(0):
+            self.poll_interval = timedelta(milliseconds=50)
+        if self.heartbeat_interval is None or self.heartbeat_interval == timedelta(0):
             self.heartbeat_interval = self.visibility_timeout / 3
+        if self.dedupe_ttl == timedelta(0):
+            self.dedupe_ttl = timedelta(hours=24)
+        if self.max_attempts == 0:
+            self.max_attempts = 3
+        if not self.consumer_id:
+            self.consumer_id = "pymq-consumer"
         if self.retry_backoff is None:
             self.retry_backoff = default_backoff
         self._validate()

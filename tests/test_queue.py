@@ -1,14 +1,16 @@
 """Integration tests for pymq.queue — requires Redis."""
 
 import asyncio
+import contextlib
 from datetime import timedelta
 
 import pytest
 from pydantic import BaseModel
 
 from pymq.errors import DuplicateError, NoMessageError
+from pymq.event import Event, EventStatus, Operation
 from pymq.message import Delivery, Message
-from pymq.options import AckRetentionPolicy, ListOptions
+from pymq.options import AckRetentionPolicy, ListOptions, RequeueOptions
 from pymq.queue import Queue
 
 
@@ -52,6 +54,19 @@ class TestEnqueueClaimAck:
         await d.ack()
         with pytest.raises(NoMessageError):
             await queue._claim_once()
+
+    async def test_noscript_reload(self, queue: Queue):
+        await queue.enqueue(Message(payload=b"first"), id="first")
+        await queue._client.script_flush()
+        assert await queue.enqueue(Message(payload=b"second"), id="second") == "second"
+
+    async def test_concurrent_noscript_reload(self, queue: Queue):
+        await queue.enqueue(Message(payload=b"first"), id="first")
+        await queue._client.script_flush()
+        ids = await asyncio.gather(
+            *(queue.enqueue(Message(payload=b"next"), id=f"next-{i}") for i in range(8))
+        )
+        assert len(ids) == 8
 
 
 class TestHeaders:
@@ -158,15 +173,13 @@ class TestDoneRetention:
         assert delivery.payload == b"new"
 
     async def test_reaper_prunes_done_records(self, queue: Queue):
-        from pymq.lifecycle import run_reaper
-
         queue._options.done_retention_ttl = timedelta(milliseconds=1)
         await queue.enqueue(Message(payload=b"old"), id="old")
         delivery = await queue._claim_once()
         await delivery.ack()
         await asyncio.sleep(0.01)
 
-        task = asyncio.create_task(run_reaper(queue, timedelta(milliseconds=1)))
+        task = asyncio.create_task(queue.run_reaper(timedelta(milliseconds=1)))
         try:
             for _ in range(100):
                 try:
@@ -180,6 +193,61 @@ class TestDoneRetention:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+
+    async def test_ack_emits_end_to_end_duration(self, queue: Queue):
+        events: list[Event] = []
+
+        class Recorder:
+            def observe(self, event: Event) -> None:
+                events.append(event)
+
+        queue._options.observer = Recorder()
+        await queue.enqueue(Message(payload=b"timed"), id="timed")
+        delivery = await queue._claim_once()
+        await asyncio.sleep(0.002)
+        await delivery.ack()
+
+        ack = next(
+            event
+            for event in events
+            if event.operation == Operation.ACK and event.status == EventStatus.OK
+        )
+        assert ack.end_to_end_duration is not None
+        assert ack.end_to_end_duration > timedelta(0)
+
+    def test_admin_default_limits(self, queue: Queue):
+        assert queue._list_options(ListOptions(count=0)) == (0, 100)
+
+
+class TestDLQAdministration:
+    async def test_list_requeue_and_delete_dlq(self, queue: Queue):
+        await queue.enqueue(
+            Message(payload=b"repair", headers={"kind": "admin"}),
+            id="repair",
+        )
+        delivery = await queue._claim_once()
+        await queue.nack(
+            delivery.id,
+            delivery.token,
+            delivery.attempts,
+            permanent=True,
+            error=RuntimeError("broken"),
+        )
+
+        items = await queue.list_dlq(ListOptions(count=10))
+        assert len(items) == 1
+        assert items[0].id == "repair"
+        assert items[0].headers == {"kind": "admin"}
+        assert items[0].last_error == "broken"
+
+        await queue.requeue_dlq("repair", RequeueOptions(reset_attempts=True))
+        delivery = await queue._claim_once()
+        assert delivery.id == "repair"
+        assert delivery.attempts == 1
+        await queue.nack(delivery.id, delivery.token, delivery.attempts, permanent=True)
+
+        await queue.delete_dlq("repair")
+        assert await queue.list_dlq() == []
 
 
 class TestPydanticSerialization:
@@ -212,10 +280,8 @@ class TestPydanticSerialization:
         task = asyncio.create_task(queue.consume(1, handler))
         await asyncio.sleep(0.5)
         task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
 
         assert len(received) == 1
         assert received[0].item == "gadget"

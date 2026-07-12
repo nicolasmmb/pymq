@@ -12,6 +12,7 @@ local errors = KEYS[11]
 
 local id = ARGV[1]
 local token = ARGV[2]
+local dedupe_ttl_ms = tonumber(ARGV[3])
 local retention_policy = ARGV[4]
 
 local now_parts = redis.call("TIME")

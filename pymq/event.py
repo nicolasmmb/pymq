@@ -5,13 +5,14 @@ Corresponds to gomq/event.go — Operation, EventStatus, Event, Hooks, Observer.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 
-class Operation(str, Enum):
+class Operation(StrEnum):
     ENQUEUE = "enqueue"
     CLAIM = "claim"
     ACK = "ack"
@@ -24,7 +25,7 @@ class Operation(str, Enum):
     ADMIN = "admin"
 
 
-class EventStatus(str, Enum):
+class EventStatus(StrEnum):
     OK = "ok"
     ERROR = "error"
     UNEXPECTED = "unexpected"
@@ -85,3 +86,14 @@ class Observer(Protocol):
     """
 
     def observe(self, event: Event) -> None: ...
+
+
+@dataclass
+class ObserverFunc:
+    """Adapt a plain callback to the Observer protocol."""
+
+    callback: Callable[[Event], None] | None = None
+
+    def observe(self, event: Event) -> None:
+        if self.callback is not None:
+            self.callback(event)

@@ -8,9 +8,11 @@ At-least-once delivery with Lua-atomic state transitions, visibility timeouts, r
 
 ```bash
 pip install pymq
+pip install 'pymq[prometheus]'  # optional
+pip install 'pymq[otel]'        # optional
 ```
 
-Requires Python 3.10+, Redis 6+.
+Requires Python 3.11+, Redis 6+.
 
 ## Quick Start
 
@@ -52,7 +54,6 @@ await queue.enqueue(Message(payload=Order(item="widget", qty=5)))
 # consume() auto-infers the type from the handler annotation
 async def handle(d: Delivery[Order]):
     print(d.payload.item)  # typed!
-    await d.ack()
 
 await queue.consume(4, handle)
 ```
@@ -99,6 +100,16 @@ await queue.prune_done(timedelta(days=7), limit=1000)
 retains them indefinitely. `dedupe_ttl` remains independent, so a reused ID
 after its dedupe period replaces its earlier retained record.
 
+## DLQ administration
+
+```python
+from pymq import ListOptions, RequeueOptions
+
+failed = await queue.list_dlq(ListOptions(count=100))
+await queue.requeue_dlq("job-123", RequeueOptions(reset_attempts=True))
+await queue.delete_dlq("job-123")
+```
+
 ## Ack / Nack / Extend
 
 ```python
@@ -108,10 +119,10 @@ d = await queue.receive()
 await d.ack()
 
 # Retry (goes back to ready queue)
-await d.nack(attempt=d.attempts)
+await d.nack()
 
 # Permanent failure (sends to DLQ)
-await d.nack(attempt=d.attempts, permanent=True)
+await d.nack(permanent=True)
 
 # Extend lease (for long processing)
 await queue.extend(d.id, d.token, timedelta(seconds=60))
@@ -132,25 +143,55 @@ queue = Queue(
 )
 ```
 
-## Managed Consumer (with signal handling)
+Prometheus and OpenTelemetry adapters use the same metric names and labels as
+`gomq` and remain optional:
 
 ```python
-from pymq import consume_with_signals
+from prometheus_client import CollectorRegistry
+from pymq.observability.prometheus import Observer
+
+registry = CollectorRegistry()
+queue = Queue(redis, queue_name="orders", observer=Observer(registry))
+```
+
+## Managed consumers and signal handling
+
+```python
+from datetime import timedelta
+from pymq import ManagedConsumerOptions
 
 async def handle(d: Delivery[Order]):
-    await d.ack()
+    print(d.payload.item)
 
-await consume_with_signals(redis, "orders", 4, handle)
+await queue.run_managed_consumer(
+    ManagedConsumerOptions(
+        worker_id="orders-1",
+        concurrency=4,
+        heartbeat_interval=timedelta(seconds=5),
+    ),
+    handle,
+)
+
+# Or run a regular consumer until SIGINT/SIGTERM:
+await queue.consume_with_signals(4, handle)
+```
+
+Managed workers can be controlled at runtime:
+
+```python
+workers = await queue.list_managed_workers()
+await queue.set_managed_concurrency(2, "orders-1")
+await queue.pause_managed_workers("orders-1")
+await queue.resume_managed_workers("orders-1")
 ```
 
 ## Testing
 
 ```bash
-# Unit tests (no Redis needed)
-pytest tests/test_errors.py tests/test_state.py tests/test_keys.py tests/test_options.py tests/test_middleware.py -v
-
-# Integration tests (needs Redis on localhost:6379)
-pytest tests/test_queue.py -v
+# Full suite (integration tests need Redis on localhost:6379)
+uv run --extra prometheus --extra otel pytest
+uv run --extra prometheus --extra otel ruff check pymq tests
+uv run --extra prometheus --extra otel pyright
 ```
 
 ## License

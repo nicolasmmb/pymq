@@ -1,11 +1,12 @@
 """Handler type and middleware for consumer/producer.
 
-Corresponds to gomq/middleware.go — Handler, ConsumerMiddleware, ProducerMiddleware, chain functions.
+Corresponds to gomq/middleware.go — Handler, middleware types and chain functions.
 """
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 T = TypeVar("T")
 

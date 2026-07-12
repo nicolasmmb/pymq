@@ -1,10 +1,8 @@
 """Shared test fixtures for pymq tests."""
 
-import asyncio
 import os
 import uuid
 
-import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
 
@@ -28,6 +26,6 @@ async def queue(redis_client):
     q = Queue(redis_client, queue_name=name)
     yield q
     # Flush test keys
-    keys = await redis_client.keys(f"pymq:{name}:*")
+    keys = await redis_client.keys(f"gomq:{name}:*")
     if keys:
         await redis_client.delete(*keys)

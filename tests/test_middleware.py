@@ -1,6 +1,5 @@
 """Tests for pymq.middleware module."""
 
-import pytest
 from pymq.middleware import chain_consumer, chain_producer
 
 
@@ -49,3 +48,30 @@ class TestChainConsumer:
         asyncio.run(wrapped(None))
         # mw1 is outermost (first applied), mw2 is innermost
         assert order == ["mw1-before", "mw2-before", "handler", "mw2-after", "mw1-after"]
+
+
+class TestChainProducer:
+    def test_order(self):
+        order = []
+
+        async def enqueue(*_args, **_kwargs):
+            order.append("enqueue")
+            return "id"
+
+        def middleware(name):
+            def wrap(next_enqueue):
+                async def wrapped(*args, **kwargs):
+                    order.append(f"{name}-before")
+                    result = await next_enqueue(*args, **kwargs)
+                    order.append(f"{name}-after")
+                    return result
+
+                return wrapped
+
+            return wrap
+
+        wrapped = chain_producer(enqueue, [middleware("one"), middleware("two")])
+        import asyncio
+
+        assert asyncio.run(wrapped()) == "id"
+        assert order == ["one-before", "two-before", "enqueue", "two-after", "one-after"]

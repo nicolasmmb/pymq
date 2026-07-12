@@ -8,7 +8,8 @@ local errors = KEYS[7]
 
 local offset = tonumber(ARGV[1])
 local count = tonumber(ARGV[2])
-local page = redis.call("ZRANGE", done, offset, offset + count - 1, "WITHSCORES")
+local stop = offset + count - 1
+local page = redis.call("ZRANGE", done, offset, stop, "WITHSCORES")
 local out = {}
 
 for i = 1, #page, 2 do

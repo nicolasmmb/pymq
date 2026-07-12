@@ -6,10 +6,11 @@ GomqError maps to Go's Error struct, sentinels map to Go's Err* vars.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
+from typing import Any
 
 
-class ErrorCode(str, Enum):
+class ErrorCode(StrEnum):
     DUPLICATE = "duplicate"
     ALREADY_DONE = "already_done"
     LOST_OWNERSHIP = "lost_ownership"
@@ -19,7 +20,7 @@ class ErrorCode(str, Enum):
     UNEXPECTED = "unexpected"
 
 
-class ErrorStatus(str, Enum):
+class ErrorStatus(StrEnum):
     DUPLICATE = "duplicate"
     DONE = "done"
     ALREADY_DONE = "already_done"
@@ -72,7 +73,7 @@ class GomqError(Exception):
             msg += f": {self.cause}"
         return msg
 
-    def __reduce__(self) -> tuple:
+    def __reduce__(self) -> tuple[Any, ...]:
         return (
             self.__class__,
             (self.code, self.op, self.queue, self.message_id, self.status, self.cause),
@@ -85,8 +86,25 @@ class PermanentError(GomqError):
     Corresponds to gomq/errors.go PermanentError.
     """
 
-    def __init__(self, cause: Exception | None = None, **kwargs) -> None:
-        super().__init__(code=ErrorCode.UNEXPECTED, cause=cause, **kwargs)
+    def __init__(
+        self,
+        cause: Exception | None = None,
+        *,
+        op: str = "",
+        queue: str = "",
+        message_id: str = "",
+        status: ErrorStatus | str = "",
+        message: str = "",
+    ) -> None:
+        super().__init__(
+            code=ErrorCode.UNEXPECTED,
+            op=op,
+            queue=queue,
+            message_id=message_id,
+            status=status,
+            cause=cause,
+            message=message,
+        )
 
     def _format(self) -> str:
         return f"permanent: {self.cause}" if self.cause else "permanent"
@@ -108,33 +126,33 @@ class NoMessageError(GomqError):
 class DuplicateError(GomqError):
     """Message ID is a duplicate of an active message."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(code=ErrorCode.DUPLICATE, **kwargs)
 
 
 class AlreadyDoneError(GomqError):
     """Message was already processed (dedup)."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(code=ErrorCode.ALREADY_DONE, **kwargs)
 
 
 class LostOwnershipError(GomqError):
     """Fencing token no longer valid — another consumer claimed this message."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(code=ErrorCode.LOST_OWNERSHIP, **kwargs)
 
 
 class InvalidConfigError(GomqError):
     """Invalid configuration."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(code=ErrorCode.INVALID_CONFIG, **kwargs)
 
 
 class DLQError(GomqError):
     """Message moved to dead-letter queue."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(code=ErrorCode.DLQ, **kwargs)

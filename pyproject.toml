@@ -15,11 +15,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+prometheus = ["prometheus-client>=0.20"]
+otel = ["opentelemetry-api>=1.25"]
+observability = [
+    "prometheus-client>=0.20",
+    "opentelemetry-api>=1.25",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.15",
     "pyright>=1.1",
+    "prometheus-client>=0.20",
+    "opentelemetry-api>=1.25",
 ]
 
 [tool.pytest.ini_options]
@@ -36,3 +44,4 @@ select = ["E", "F", "I", "N", "UP", "B", "SIM"]
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
+include = ["pymq"]
