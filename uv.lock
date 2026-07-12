@@ -214,7 +214,6 @@ wheels = [
 
 [[package]]
 name = "pymq"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
@@ -256,7 +255,7 @@ requires-dist = [
     { name = "redis", specifier = ">=5.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15" },
 ]
-provides-extras = ["prometheus", "otel", "observability", "dev"]
+provides-extras = ["dev", "observability", "otel", "prometheus"]
 
 [[package]]
 name = "pyright"

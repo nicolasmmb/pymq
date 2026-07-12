@@ -113,4 +113,7 @@ __all__ = [
     "set_managed_concurrency",
 ]
 
-__version__ = "0.1.0"
+try:
+    from pymq._version import __version__
+except ModuleNotFoundError:  # Direct execution from an unbuilt checkout.
+    __version__ = "0+unknown"
