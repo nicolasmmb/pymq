@@ -27,10 +27,10 @@ exclude = ["/.uv-cache"]
 
 [project.optional-dependencies]
 prometheus = ["prometheus-client>=0.20"]
-otel = ["opentelemetry-api>=1.25"]
+otel = ["opentelemetry-api>=1.45.1"]
 observability = [
     "prometheus-client>=0.20",
-    "opentelemetry-api>=1.25",
+    "opentelemetry-api>=1.45.1",
 ]
 dev = [
     "pytest>=8.0",
@@ -38,7 +38,7 @@ dev = [
     "ruff>=0.15",
     "pyright>=1.1",
     "prometheus-client>=0.20",
-    "opentelemetry-api>=1.25",
+    "opentelemetry-api>=1.45.1",
 ]
 
 [tool.pytest.ini_options]
